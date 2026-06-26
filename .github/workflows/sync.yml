@@ -43,13 +43,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          STATUS=$(curl -s \
-            -o /dev/null \
-            -w "%{http_code}" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.version.outputs.version }}")
-
-          if [ "$STATUS" = "200" ]; then
+          if gh release view "${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "Release already exists."
           fi
@@ -66,7 +60,7 @@ jobs:
             "$BASE_URL/$VERSION/manifest.json" \
             -o manifest.json
 
-      - name: Download binaries
+      - name: Download, verify and package
         if: steps.release.outputs.skip != 'true'
         shell: bash
         run: |
@@ -74,64 +68,73 @@ jobs:
 
           VERSION="${{ steps.version.outputs.version }}"
 
-          mkdir -p \
-            dist/darwin-arm64 \
-            dist/linux-x64
+          mkdir -p dist work
 
-          curl -fsSL \
-            "$BASE_URL/$VERSION/darwin-arm64/claude" \
-            -o dist/darwin-arm64/claude
+          : > dist/SHA256SUMS
+          : > release-notes.md
 
-          curl -fsSL \
-            "$BASE_URL/$VERSION/linux-x64/claude" \
-            -o dist/linux-x64/claude
+          {
+            echo "Automated sync from the official Claude Code download server."
+            echo
+            echo "Version: $VERSION"
+            echo "Commit: $(jq -r '.commit' manifest.json)"
+            echo "Build Date: $(jq -r '.buildDate' manifest.json)"
+            echo
+            echo "Platforms:"
+          } > release-notes.md
 
-          chmod +x \
-            dist/darwin-arm64/claude \
-            dist/linux-x64/claude
+          jq -c '.platforms | to_entries[]' manifest.json | while read -r ENTRY; do
+            PLATFORM=$(jq -r '.key' <<<"$ENTRY")
+            BINARY=$(jq -r '.value.binary' <<<"$ENTRY")
+            EXPECTED_SHA=$(jq -r '.value.checksum' <<<"$ENTRY")
+            EXPECTED_SIZE=$(jq -r '.value.size' <<<"$ENTRY")
 
-      - name: Verify checksum
-        if: steps.release.outputs.skip != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
+            echo "- $PLATFORM" >> release-notes.md
 
-          DARWIN_EXPECTED=$(jq -r '.platforms["darwin-arm64"].checksum' manifest.json)
-          LINUX_EXPECTED=$(jq -r '.platforms["linux-x64"].checksum' manifest.json)
+            mkdir -p "work/$PLATFORM"
 
-          DARWIN_ACTUAL=$(sha256sum dist/darwin-arm64/claude | cut -d' ' -f1)
-          LINUX_ACTUAL=$(sha256sum dist/linux-x64/claude | cut -d' ' -f1)
+            curl -fsSL \
+              "$BASE_URL/$VERSION/$PLATFORM/$BINARY" \
+              -o "work/$PLATFORM/$BINARY"
 
-          [ "$DARWIN_EXPECTED" = "$DARWIN_ACTUAL" ]
-          [ "$LINUX_EXPECTED" = "$LINUX_ACTUAL" ]
+            if [[ "$BINARY" != *.exe ]]; then
+              chmod +x "work/$PLATFORM/$BINARY"
+            fi
 
-          (
-            cd dist/darwin-arm64
-            sha256sum claude > SHA256SUMS
-          )
+            ACTUAL_SIZE=$(stat -c%s "work/$PLATFORM/$BINARY")
+            if [[ "$ACTUAL_SIZE" != "$EXPECTED_SIZE" ]]; then
+              echo "Size mismatch for $PLATFORM"
+              exit 1
+            fi
 
-          (
-            cd dist/linux-x64
-            sha256sum claude > SHA256SUMS
-          )
+            ACTUAL_SHA=$(sha256sum "work/$PLATFORM/$BINARY" | cut -d' ' -f1)
+            if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+              echo "Checksum mismatch for $PLATFORM"
+              exit 1
+            fi
 
-      - name: Package archives
-        if: steps.release.outputs.skip != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
+            (
+              cd "work/$PLATFORM"
+              sha256sum "$BINARY" > SHA256SUMS
 
-          tar \
-            -C dist/darwin-arm64 \
-            -czf claude-darwin-arm64.tar.gz \
-            claude \
-            SHA256SUMS
+              if [[ "$BINARY" == *.exe ]]; then
+                zip -q "../../dist/claude-$PLATFORM.zip" "$BINARY" SHA256SUMS
+              else
+                tar -czf "../../dist/claude-$PLATFORM.tar.gz" "$BINARY" SHA256SUMS
+              fi
+            )
 
-          tar \
-            -C dist/linux-x64 \
-            -czf claude-linux-x64.tar.gz \
-            claude \
-            SHA256SUMS
+            (
+              cd dist
+              if [[ -f "claude-$PLATFORM.zip" ]]; then
+                sha256sum "claude-$PLATFORM.zip" >> SHA256SUMS
+              else
+                sha256sum "claude-$PLATFORM.tar.gz" >> SHA256SUMS
+              fi
+            )
+
+            rm -rf "work/$PLATFORM"
+          done
 
       - name: Create GitHub Release
         if: steps.release.outputs.skip != 'true'
@@ -139,15 +142,10 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.version }}
           name: Claude Code v${{ steps.version.outputs.version }}
-          body: |
-            Automated sync from the official Claude Code download server.
-
-            - Binary integrity verified against the official manifest.
-            - Packaged as tar.gz with executable permissions preserved.
+          body_path: release-notes.md
           generate_release_notes: false
           files: |
-            claude-darwin-arm64.tar.gz
-            claude-linux-x64.tar.gz
+            dist/*
             manifest.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
