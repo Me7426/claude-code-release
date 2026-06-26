@@ -1,0 +1,113 @@
+name: Sync Claude Code Release
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: claude-code-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    env:
+      BASE_URL: https://downloads.claude.ai/claude-code-releases
+
+    steps:
+      - name: Get latest version
+        id: version
+        run: |
+          set -euo pipefail
+
+          VERSION=$(curl -fsSL "$BASE_URL/latest")
+
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
+            echo "Invalid version: $VERSION"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check release exists
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          STATUS=$(curl -s \
+            -o /dev/null \
+            -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.version.outputs.version }}")
+
+          if [ "$STATUS" = "200" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release already exists."
+          fi
+
+      - name: Download manifest
+        if: steps.release.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ steps.version.outputs.version }}"
+
+          curl -fsSL \
+            "$BASE_URL/$VERSION/manifest.json" \
+            -o manifest.json
+
+      - name: Download binaries
+        if: steps.release.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ steps.version.outputs.version }}"
+
+          mkdir dist
+
+          curl -fsSL \
+            "$BASE_URL/$VERSION/darwin-arm64/claude" \
+            -o dist/claude-darwin-arm64
+
+          curl -fsSL \
+            "$BASE_URL/$VERSION/linux-x64/claude" \
+            -o dist/claude-linux-x64
+
+          chmod +x dist/*
+
+      - name: Verify checksum
+        if: steps.release.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+
+          DARWIN_EXPECTED=$(jq -r '.platforms["darwin-arm64"].checksum' manifest.json)
+          LINUX_EXPECTED=$(jq -r '.platforms["linux-x64"].checksum' manifest.json)
+
+          DARWIN_ACTUAL=$(sha256sum dist/claude-darwin-arm64 | cut -d' ' -f1)
+          LINUX_ACTUAL=$(sha256sum dist/claude-linux-x64 | cut -d' ' -f1)
+
+          [ "$DARWIN_EXPECTED" = "$DARWIN_ACTUAL" ]
+          [ "$LINUX_EXPECTED" = "$LINUX_ACTUAL" ]
+
+          sha256sum dist/* > dist/SHA256SUMS
+
+      - name: Create Release
+        if: steps.release.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Claude Code v${{ steps.version.outputs.version }}
+          generate_release_notes: false
+          body: |
+            Automated sync from the official Claude Code download server.
+
+            SHA256 hashes are verified against the official manifest before publishing.
+          files: |
+            dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
