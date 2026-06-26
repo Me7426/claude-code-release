@@ -22,23 +22,27 @@ jobs:
     steps:
       - name: Get latest version
         id: version
+        shell: bash
         run: |
           set -euo pipefail
 
           VERSION=$(curl -fsSL "$BASE_URL/latest")
 
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
-            echo "Invalid version: $VERSION"
+            echo "Invalid version returned: $VERSION"
             exit 1
           fi
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Check release exists
+      - name: Check if release already exists
         id: release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
+          set -euo pipefail
+
           STATUS=$(curl -s \
             -o /dev/null \
             -w "%{http_code}" \
@@ -52,6 +56,7 @@ jobs:
 
       - name: Download manifest
         if: steps.release.outputs.skip != 'true'
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -63,51 +68,86 @@ jobs:
 
       - name: Download binaries
         if: steps.release.outputs.skip != 'true'
+        shell: bash
         run: |
           set -euo pipefail
 
           VERSION="${{ steps.version.outputs.version }}"
 
-          mkdir dist
+          mkdir -p \
+            dist/darwin-arm64 \
+            dist/linux-x64
 
           curl -fsSL \
             "$BASE_URL/$VERSION/darwin-arm64/claude" \
-            -o dist/claude-darwin-arm64
+            -o dist/darwin-arm64/claude
 
           curl -fsSL \
             "$BASE_URL/$VERSION/linux-x64/claude" \
-            -o dist/claude-linux-x64
+            -o dist/linux-x64/claude
 
-          chmod +x dist/*
+          chmod +x \
+            dist/darwin-arm64/claude \
+            dist/linux-x64/claude
 
       - name: Verify checksum
         if: steps.release.outputs.skip != 'true'
+        shell: bash
         run: |
           set -euo pipefail
 
           DARWIN_EXPECTED=$(jq -r '.platforms["darwin-arm64"].checksum' manifest.json)
           LINUX_EXPECTED=$(jq -r '.platforms["linux-x64"].checksum' manifest.json)
 
-          DARWIN_ACTUAL=$(sha256sum dist/claude-darwin-arm64 | cut -d' ' -f1)
-          LINUX_ACTUAL=$(sha256sum dist/claude-linux-x64 | cut -d' ' -f1)
+          DARWIN_ACTUAL=$(sha256sum dist/darwin-arm64/claude | cut -d' ' -f1)
+          LINUX_ACTUAL=$(sha256sum dist/linux-x64/claude | cut -d' ' -f1)
 
           [ "$DARWIN_EXPECTED" = "$DARWIN_ACTUAL" ]
           [ "$LINUX_EXPECTED" = "$LINUX_ACTUAL" ]
 
-          sha256sum dist/* > dist/SHA256SUMS
+          (
+            cd dist/darwin-arm64
+            sha256sum claude > SHA256SUMS
+          )
 
-      - name: Create Release
+          (
+            cd dist/linux-x64
+            sha256sum claude > SHA256SUMS
+          )
+
+      - name: Package archives
+        if: steps.release.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tar \
+            -C dist/darwin-arm64 \
+            -czf claude-darwin-arm64.tar.gz \
+            claude \
+            SHA256SUMS
+
+          tar \
+            -C dist/linux-x64 \
+            -czf claude-linux-x64.tar.gz \
+            claude \
+            SHA256SUMS
+
+      - name: Create GitHub Release
         if: steps.release.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.version }}
           name: Claude Code v${{ steps.version.outputs.version }}
-          generate_release_notes: false
           body: |
             Automated sync from the official Claude Code download server.
 
-            SHA256 hashes are verified against the official manifest before publishing.
+            - Binary integrity verified against the official manifest.
+            - Packaged as tar.gz with executable permissions preserved.
+          generate_release_notes: false
           files: |
-            dist/*
+            claude-darwin-arm64.tar.gz
+            claude-linux-x64.tar.gz
+            manifest.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
